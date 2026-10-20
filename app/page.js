@@ -84,42 +84,6 @@ export default function PostureMonitorPage() {
     firePostureApi();
   }, [postureStatus]);
 
-  // Page Visibility API listener: silence buzzer alarm when switching tabs
-  useEffect(() => {
-    const handleVisibilityChange = async () => {
-      if (document.hidden) {
-        // Tab inactive: immediately silence database alarm by posting {"status": "good"}
-        setPostureStatus('Paused (Tab Inactive)');
-
-        try {
-          const res = await fetch('/api/posture', {
-            method: 'POST',
-            headers: {
-              'Content-Type': 'application/json',
-            },
-            body: JSON.stringify({ status: 'good' }),
-          });
-
-          await res.json().catch(() => null);
-
-          setApiSync({
-            status: res.ok ? 'synced' : 'error',
-            lastPayload: 'good (tab inactive)',
-            lastTime: new Date().toLocaleTimeString(),
-            statusCode: res.status,
-          });
-        } catch (err) {
-          console.error('Failed to silence posture alarm on visibilitychange:', err);
-        }
-      }
-    };
-
-    document.addEventListener('visibilitychange', handleVisibilityChange);
-    return () => {
-      document.removeEventListener('visibilitychange', handleVisibilityChange);
-    };
-  }, []);
-
   // Initialize TensorFlow.js and MoveNet detector
   useEffect(() => {
     let isCancelled = false;
@@ -179,14 +143,6 @@ export default function PostureMonitorPage() {
 
       const video = webcamRef.current?.video;
       const canvas = canvasRef.current;
-
-      // If document is hidden (user switched tabs), pause pose tracking loop until tab is active again
-      if (typeof document !== 'undefined' && document.hidden) {
-        if (isActive) {
-          animationFrameIdRef.current = requestAnimationFrame(detectPose);
-        }
-        return;
-      }
 
       if (
         detectorRef.current &&
@@ -433,8 +389,6 @@ export default function PostureMonitorPage() {
                 ? 'bg-rose-500/10 border-rose-500/30 text-rose-400'
                 : postureStatus === 'No person detected'
                 ? 'bg-amber-500/10 border-amber-500/30 text-amber-400'
-                : postureStatus === 'Paused (Tab Inactive)'
-                ? 'bg-zinc-800/80 border-zinc-700/80 text-zinc-300'
                 : 'bg-zinc-900 border-zinc-800 text-zinc-400'
             }`}
           >
@@ -446,8 +400,6 @@ export default function PostureMonitorPage() {
                   ? 'bg-rose-500 shadow-[0_0_8px_rgba(244,63,94,0.8)] animate-pulse'
                   : postureStatus === 'No person detected'
                   ? 'bg-amber-400 animate-pulse'
-                  : postureStatus === 'Paused (Tab Inactive)'
-                  ? 'bg-zinc-400'
                   : 'bg-zinc-500 animate-pulse'
               }`}
             />
@@ -458,8 +410,6 @@ export default function PostureMonitorPage() {
                 ? 'Slouch Detected'
                 : postureStatus === 'No person detected'
                 ? 'No person detected'
-                : postureStatus === 'Paused (Tab Inactive)'
-                ? 'Paused (Tab Inactive)'
                 : baseline === null
                 ? 'Calibration Required'
                 : 'Aligning Sensor...'}
@@ -473,8 +423,6 @@ export default function PostureMonitorPage() {
               ? 'Live ratio dropped below 85% of your baseline. Straighten up.'
               : postureStatus === 'No person detected'
               ? 'No person detected in camera view. Step into frame to resume.'
-              : postureStatus === 'Paused (Tab Inactive)'
-              ? 'Tab inactive. Alarm silenced to good. Return to tab to resume.'
               : baseline === null
               ? 'Sit upright facing the camera and click "Calibrate Baseline" below.'
               : 'Position your face and shoulders within clear camera view.'}
