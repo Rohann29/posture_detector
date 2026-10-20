@@ -1,12 +1,11 @@
 'use client';
 
-import React, { useRef, useState, useEffect, useCallback } from 'react';
+import React, { useRef, useState, useEffect } from 'react';
 import Webcam from 'react-webcam';
 import * as tf from '@tensorflow/tfjs-core';
 import '@tensorflow/tfjs-backend-webgl';
 import * as poseDetection from '@tensorflow-models/pose-detection/dist/index.js';
 
-const DEFAULT_THRESHOLD = 70; // Healthy Y-axis pixel threshold between nose and shoulders
 const MIN_CONFIDENCE = 0.3; // Minimum confidence score for landmarks
 
 export default function PostureMonitorPage() {
@@ -21,9 +20,14 @@ export default function PostureMonitorPage() {
   const [isCameraActive, setIsCameraActive] = useState(true);
   const [isCameraReady, setIsCameraReady] = useState(false);
   const [postureStatus, setPostureStatus] = useState('calibrating'); // 'good' | 'slouching' | 'calibrating'
+  
+  // Scale-invariant posture metrics
+  const [liveRatio, setLiveRatio] = useState(null);
   const [liveDistance, setLiveDistance] = useState(null);
-  const [threshold, setThreshold] = useState(DEFAULT_THRESHOLD);
+  const [liveShoulderWidth, setLiveShoulderWidth] = useState(null);
+  const [baseline, setBaseline] = useState(null); // Calibrated baseline postureRatio
   const [calibrationNotice, setCalibrationNotice] = useState('');
+  
   const [apiSync, setApiSync] = useState({
     status: 'idle',
     lastPayload: null,
@@ -31,52 +35,54 @@ export default function PostureMonitorPage() {
     statusCode: null,
   });
 
-  // Mutable refs for tracking in the requestAnimationFrame loop
-  const thresholdRef = useRef(threshold);
+  // Mutable refs for tracking within animation frames without stale closures
+  const baselineRef = useRef(baseline);
   useEffect(() => {
-    thresholdRef.current = threshold;
-  }, [threshold]);
+    baselineRef.current = baseline;
+  }, [baseline]);
 
-  const lastSentStatusRef = useRef(null);
-  const lastSentTimeRef = useRef(0);
-  const isSendingRef = useRef(false);
-  const latestDistanceRef = useRef(null);
+  const latestRatioRef = useRef(null);
 
-  // POST request to /api/posture
-  const sendPostureUpdate = useCallback(async (status) => {
-    if (isSendingRef.current) return;
-    isSendingRef.current = true;
-    lastSentStatusRef.current = status;
-    lastSentTimeRef.current = Date.now();
-
-    try {
-      const res = await fetch('/api/posture', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({ status }),
-      });
-      await res.json().catch(() => null);
-
-      setApiSync({
-        status: res.ok ? 'synced' : 'error',
-        lastPayload: status,
-        lastTime: new Date().toLocaleTimeString(),
-        statusCode: res.status,
-      });
-    } catch (err) {
-      console.error('Failed to post posture status to /api/posture:', err);
-      setApiSync((prev) => ({
-        ...prev,
-        status: 'error',
-        lastPayload: status,
-        lastTime: new Date().toLocaleTimeString(),
-      }));
-    } finally {
-      isSendingRef.current = false;
+  // 1. THE API BRIDGE: Dedicated useEffect watching postureStatus
+  // Whenever the state changes (and ONLY when it changes), fire POST to /api/posture
+  useEffect(() => {
+    if (postureStatus !== 'good' && postureStatus !== 'slouching') {
+      return;
     }
-  }, []);
+
+    const currentStatus = postureStatus;
+
+    async function firePostureApi() {
+      try {
+        const res = await fetch('/api/posture', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({ status: currentStatus }),
+        });
+
+        await res.json().catch(() => null);
+
+        setApiSync({
+          status: res.ok ? 'synced' : 'error',
+          lastPayload: currentStatus,
+          lastTime: new Date().toLocaleTimeString(),
+          statusCode: res.status,
+        });
+      } catch (err) {
+        console.error('Failed to post posture status to /api/posture:', err);
+        setApiSync((prev) => ({
+          ...prev,
+          status: 'error',
+          lastPayload: currentStatus,
+          lastTime: new Date().toLocaleTimeString(),
+        }));
+      }
+    }
+
+    firePostureApi();
+  }, [postureStatus]);
 
   // Initialize TensorFlow.js and MoveNet detector
   useEffect(() => {
@@ -128,7 +134,7 @@ export default function PostureMonitorPage() {
     };
   }, []);
 
-  // Continuous Pose Detection & Distance Loop
+  // Continuous Pose Detection Loop with Scale-Invariant Math
   useEffect(() => {
     let isActive = true;
 
@@ -171,99 +177,91 @@ export default function PostureMonitorPage() {
               const hasRightShoulder =
                 rightShoulder && (rightShoulder.score ?? 0) >= MIN_CONFIDENCE;
 
-              if (hasNose && (hasLeftShoulder || hasRightShoulder)) {
-                // Calculate shoulder Y and X (averaging if both are visible)
-                let shoulderY;
-                let shoulderX;
+              if (hasNose && hasLeftShoulder && hasRightShoulder) {
+                // 1. Calculate shoulderWidth: distance between left_shoulder.x and right_shoulder.x
+                const shoulderWidth = Math.abs(leftShoulder.x - rightShoulder.x);
 
-                if (hasLeftShoulder && hasRightShoulder) {
-                  shoulderY = (leftShoulder.y + rightShoulder.y) / 2;
-                  shoulderX = (leftShoulder.x + rightShoulder.x) / 2;
-                } else if (hasLeftShoulder) {
-                  shoulderY = leftShoulder.y;
-                  shoulderX = leftShoulder.x;
-                } else {
-                  shoulderY = rightShoulder.y;
-                  shoulderX = rightShoulder.x;
-                }
+                // 2. Calculate verticalDistance between nose.y and midpoint of shoulders
+                const midpointShoulderY = (leftShoulder.y + rightShoulder.y) / 2;
+                const midpointShoulderX = (leftShoulder.x + rightShoulder.x) / 2;
+                const verticalDistance = midpointShoulderY - nose.y;
 
-                // Y-axis distance between nose and shoulders (shoulders are lower on screen, so higher Y)
-                const distanceY = Math.round(shoulderY - nose.y);
-                const positiveDistance = Math.max(0, distanceY);
+                if (shoulderWidth > 20) {
+                  // 3. Calculate postureRatio = verticalDistance / shoulderWidth
+                  const postureRatio = Math.max(0, verticalDistance) / shoulderWidth;
 
-                setLiveDistance(positiveDistance);
-                latestDistanceRef.current = positiveDistance;
+                  latestRatioRef.current = postureRatio;
+                  setLiveRatio(postureRatio);
+                  setLiveDistance(Math.round(verticalDistance));
+                  setLiveShoulderWidth(Math.round(shoulderWidth));
 
-                // Evaluate posture against healthy threshold
-                const currentStatus =
-                  positiveDistance < thresholdRef.current ? 'slouching' : 'good';
-                setPostureStatus(currentStatus);
+                  // 5. Trigger "slouching" status if live postureRatio drops below 85% of calibrated baseline
+                  if (baselineRef.current !== null) {
+                    const slouchThreshold = baselineRef.current * 0.85;
+                    const nextStatus = postureRatio < slouchThreshold ? 'slouching' : 'good';
+                    setPostureStatus(nextStatus);
+                  } else {
+                    setPostureStatus('calibrating');
+                  }
 
-                // Send POST request when status changes or periodically (heartbeat every 3s)
-                const now = Date.now();
-                const statusChanged = currentStatus !== lastSentStatusRef.current;
-                const timeSinceLastSend = now - lastSentTimeRef.current;
+                  // Draw clean visual overlay on canvas
+                  const isGood =
+                    baselineRef.current !== null
+                      ? postureRatio >= baselineRef.current * 0.85
+                      : true;
 
-                if ((statusChanged || timeSinceLastSend >= 3000) && !isSendingRef.current) {
-                  sendPostureUpdate(currentStatus);
-                }
+                  const strokeColor = isGood
+                    ? 'rgba(52, 211, 153, 0.9)'
+                    : 'rgba(244, 63, 94, 0.9)';
+                  const fillColor = isGood ? '#10b981' : '#f43f5e';
 
-                // Draw overlay skeleton & measurement graphics
-                const strokeColor =
-                  currentStatus === 'good' ? 'rgba(52, 211, 153, 0.9)' : 'rgba(244, 63, 94, 0.9)';
-                const fillColor =
-                  currentStatus === 'good' ? '#10b981' : '#f43f5e';
+                  ctx.lineWidth = 2;
+                  ctx.strokeStyle = strokeColor;
+                  ctx.fillStyle = fillColor;
 
-                ctx.lineWidth = 2;
-                ctx.strokeStyle = strokeColor;
-                ctx.fillStyle = fillColor;
-
-                // Draw shoulder connection bar if both visible
-                if (hasLeftShoulder && hasRightShoulder) {
+                  // Shoulder span horizontal line (shoulderWidth)
                   ctx.beginPath();
                   ctx.moveTo(leftShoulder.x, leftShoulder.y);
                   ctx.lineTo(rightShoulder.x, rightShoulder.y);
                   ctx.stroke();
-                }
 
-                // Draw vertical distance line between nose and shoulder plane
-                ctx.setLineDash([4, 4]);
-                ctx.beginPath();
-                ctx.moveTo(nose.x, nose.y);
-                ctx.lineTo(nose.x, shoulderY);
-                ctx.stroke();
+                  // Vertical line from nose to shoulder midpoint (verticalDistance)
+                  ctx.setLineDash([4, 4]);
+                  ctx.beginPath();
+                  ctx.moveTo(nose.x, nose.y);
+                  ctx.lineTo(midpointShoulderX, midpointShoulderY);
+                  ctx.stroke();
+                  ctx.setLineDash([]);
 
-                // Draw horizontal guide at shoulder level centered at shoulderX
-                ctx.beginPath();
-                ctx.moveTo(shoulderX - 25, shoulderY);
-                ctx.lineTo(shoulderX + 25, shoulderY);
-                ctx.stroke();
-                ctx.setLineDash([]);
+                  // Keypoint dots
+                  // Nose
+                  ctx.beginPath();
+                  ctx.arc(nose.x, nose.y, 5, 0, 2 * Math.PI);
+                  ctx.fill();
 
-                // Keypoint circles
-                // Nose
-                ctx.beginPath();
-                ctx.arc(nose.x, nose.y, 5, 0, 2 * Math.PI);
-                ctx.fill();
-
-                // Left Shoulder
-                if (hasLeftShoulder) {
+                  // Left & Right Shoulder
                   ctx.beginPath();
                   ctx.arc(leftShoulder.x, leftShoulder.y, 4, 0, 2 * Math.PI);
                   ctx.fill();
-                }
 
-                // Right Shoulder
-                if (hasRightShoulder) {
                   ctx.beginPath();
                   ctx.arc(rightShoulder.x, rightShoulder.y, 4, 0, 2 * Math.PI);
                   ctx.fill();
-                }
 
-                // Measurement label next to vertical line
-                ctx.font = '11px ui-monospace, SFMono-Regular, Menlo, monospace';
-                ctx.fillStyle = '#ffffff';
-                ctx.fillText(`${positiveDistance}px`, nose.x + 10, (nose.y + shoulderY) / 2);
+                  // Shoulder Midpoint dot
+                  ctx.beginPath();
+                  ctx.arc(midpointShoulderX, midpointShoulderY, 3, 0, 2 * Math.PI);
+                  ctx.fill();
+
+                  // Metric label overlay next to vertical guide line
+                  ctx.font = '11px ui-monospace, SFMono-Regular, Menlo, monospace';
+                  ctx.fillStyle = '#ffffff';
+                  ctx.fillText(
+                    `Ratio: ${postureRatio.toFixed(2)}`,
+                    midpointShoulderX + 12,
+                    (nose.y + midpointShoulderY) / 2
+                  );
+                }
               } else {
                 setPostureStatus('calibrating');
               }
@@ -291,28 +289,36 @@ export default function PostureMonitorPage() {
         cancelAnimationFrame(animationFrameIdRef.current);
       }
     };
-  }, [modelLoading, isCameraActive, sendPostureUpdate]);
+  }, [modelLoading, isCameraActive]);
 
-  // Calibration function: Calibrate healthy threshold based on current upright posture
-  const handleCalibrate = () => {
-    if (latestDistanceRef.current && latestDistanceRef.current > 30) {
-      // Set healthy threshold to 82% of current upright measurement
-      const calibratedThreshold = Math.max(35, Math.round(latestDistanceRef.current * 0.82));
-      setThreshold(calibratedThreshold);
+  // 4. THE ACCURACY FIX: Calibrate Baseline Handler
+  // Saves the current scale-invariant postureRatio as the baseline state variable
+  const handleCalibrateBaseline = () => {
+    if (latestRatioRef.current !== null && latestRatioRef.current > 0.05) {
+      const newBaseline = latestRatioRef.current;
+      setBaseline(newBaseline);
+      baselineRef.current = newBaseline;
+      setPostureStatus('good');
+
+      const slouchThreshold = (newBaseline * 0.85).toFixed(2);
       setCalibrationNotice(
-        `Calibrated to ${calibratedThreshold}px (baseline: ${latestDistanceRef.current}px)`
+        `Baseline set: ${newBaseline.toFixed(2)} (Slouch threshold: < ${slouchThreshold})`
       );
-      setTimeout(() => setCalibrationNotice(''), 4000);
+      setTimeout(() => setCalibrationNotice(''), 4500);
     } else {
-      setCalibrationNotice('Could not calibrate: please sit upright facing the camera.');
+      setCalibrationNotice(
+        'Calibration failed: Please position your face and shoulders clearly in camera.'
+      );
       setTimeout(() => setCalibrationNotice(''), 4000);
     }
   };
 
-  const handleResetThreshold = () => {
-    setThreshold(DEFAULT_THRESHOLD);
-    setCalibrationNotice(`Reset to default (${DEFAULT_THRESHOLD}px)`);
-    setTimeout(() => setCalibrationNotice(''), 3000);
+  const handleResetBaseline = () => {
+    setBaseline(null);
+    baselineRef.current = null;
+    setPostureStatus('calibrating');
+    setCalibrationNotice('Baseline cleared. Click "Calibrate Baseline" to re-calibrate.');
+    setTimeout(() => setCalibrationNotice(''), 3500);
   };
 
   return (
@@ -326,7 +332,7 @@ export default function PostureMonitorPage() {
               ALIGN // Sentinel
             </span>
             <span className="text-xs text-zinc-500 tracking-tight">
-              MoveNet Realtime Posture Tracking
+              Scale-Invariant Posture Ratio Tracking
             </span>
           </div>
         </div>
@@ -378,15 +384,19 @@ export default function PostureMonitorPage() {
                 ? 'Optimal Posture'
                 : postureStatus === 'slouching'
                 ? 'Slouch Detected'
+                : baseline === null
+                ? 'Calibration Required'
                 : 'Aligning Sensor...'}
             </span>
           </div>
 
-          <p className="text-xs text-zinc-400 mt-2.5 max-w-sm">
+          <p className="text-xs text-zinc-400 mt-2.5 max-w-md">
             {postureStatus === 'good'
               ? 'Spine and cervical distance within healthy upright alignment.'
               : postureStatus === 'slouching'
-              ? 'Nose-to-shoulder vertical distance is below threshold. Lift your chest.'
+              ? 'Live ratio dropped below 85% of your baseline. Straighten up.'
+              : baseline === null
+              ? 'Sit upright facing the camera and click "Calibrate Baseline" below.'
               : 'Position your face and shoulders within clear camera view.'}
           </p>
         </div>
@@ -406,8 +416,9 @@ export default function PostureMonitorPage() {
             <div className="absolute inset-0 z-20 flex flex-col items-center justify-center bg-zinc-950/95 p-6 text-center">
               <p className="text-xs text-rose-400 font-medium mb-2">{modelError}</p>
               <button
+                type="button"
                 onClick={() => window.location.reload()}
-                className="text-xs px-3 py-1.5 rounded-md bg-zinc-800 hover:bg-zinc-700 text-zinc-200"
+                className="text-xs px-3 py-1.5 rounded-md bg-zinc-800 hover:bg-zinc-700 text-zinc-200 cursor-pointer"
               >
                 Reload Application
               </button>
@@ -464,14 +475,14 @@ export default function PostureMonitorPage() {
           {/* Top-Right HUD Tag */}
           <div className="absolute top-3 right-3 z-10 flex items-center gap-2">
             <span className="px-2.5 py-1 rounded-md bg-zinc-950/70 border border-zinc-800 text-[10px] font-mono uppercase tracking-wider text-zinc-400 backdrop-blur-sm">
-              MoveNet Lightning
+              Scale Invariant
             </span>
           </div>
 
           {/* Bottom Feed Overlay Stats */}
           <div className="absolute bottom-3 inset-x-3 z-10 flex items-center justify-between text-[11px] font-mono text-zinc-300">
             <div className="px-2.5 py-1 rounded-md bg-zinc-950/80 border border-zinc-800/80 backdrop-blur-sm">
-              Delta:{' '}
+              Live Ratio:{' '}
               <span
                 className={`font-semibold ${
                   postureStatus === 'good'
@@ -481,12 +492,15 @@ export default function PostureMonitorPage() {
                     : 'text-zinc-400'
                 }`}
               >
-                {liveDistance !== null ? `${liveDistance}px` : '--'}
+                {liveRatio !== null ? liveRatio.toFixed(2) : '--'}
               </span>
             </div>
 
             <div className="px-2.5 py-1 rounded-md bg-zinc-950/80 border border-zinc-800/80 backdrop-blur-sm text-zinc-400">
-              Threshold: <span className="text-zinc-200">{threshold}px</span>
+              Baseline:{' '}
+              <span className="text-zinc-200">
+                {baseline !== null ? baseline.toFixed(2) : 'Unset'}
+              </span>
             </div>
           </div>
         </div>
@@ -495,22 +509,35 @@ export default function PostureMonitorPage() {
         <div className="w-full max-w-xl grid grid-cols-3 gap-3">
           <div className="flex flex-col p-3 rounded-xl bg-zinc-900/60 border border-zinc-800/80">
             <span className="text-[10px] uppercase font-mono tracking-wider text-zinc-500">
-              Distance (Y)
+              Posture Ratio
             </span>
             <span className="text-lg font-mono font-semibold text-zinc-100 mt-0.5">
-              {liveDistance !== null ? `${liveDistance} px` : '--'}
+              {liveRatio !== null ? liveRatio.toFixed(2) : '--'}
             </span>
-            <span className="text-[10px] text-zinc-500 mt-1">Nose to shoulders</span>
+            <span className="text-[10px] text-zinc-500 mt-1">
+              {liveDistance !== null && liveShoulderWidth !== null
+                ? `${liveDistance}px / ${liveShoulderWidth}px`
+                : 'vertical / width'}
+            </span>
           </div>
 
           <div className="flex flex-col p-3 rounded-xl bg-zinc-900/60 border border-zinc-800/80">
             <span className="text-[10px] uppercase font-mono tracking-wider text-zinc-500">
-              Threshold
+              Baseline / Threshold
             </span>
             <span className="text-lg font-mono font-semibold text-zinc-100 mt-0.5">
-              {threshold} px
+              {baseline !== null ? (
+                <>
+                  {baseline.toFixed(2)}{' '}
+                  <span className="text-xs text-zinc-400 font-normal">
+                    (&lt;{(baseline * 0.85).toFixed(2)})
+                  </span>
+                </>
+              ) : (
+                'Uncalibrated'
+              )}
             </span>
-            <span className="text-[10px] text-zinc-500 mt-1">Slouch trigger level</span>
+            <span className="text-[10px] text-zinc-500 mt-1">Slouch at &lt; 85% baseline</span>
           </div>
 
           <div className="flex flex-col p-3 rounded-xl bg-zinc-900/60 border border-zinc-800/80">
@@ -526,42 +553,46 @@ export default function PostureMonitorPage() {
                   : 'text-zinc-400'
               }`}
             >
-              {apiSync.lastPayload || 'Idle'}
+              {apiSync.lastPayload || (postureStatus !== 'calibrating' ? postureStatus : 'Idle')}
             </span>
             <span className="text-[10px] text-zinc-500 mt-1">
-              {apiSync.lastTime ? `Synced ${apiSync.lastTime}` : 'Awaiting data'}
+              {apiSync.lastTime ? `Synced ${apiSync.lastTime}` : 'Awaiting change'}
             </span>
           </div>
         </div>
 
-        {/* Controls Panel */}
-        <div className="w-full max-w-xl flex flex-col gap-4 p-4 rounded-xl bg-zinc-900/40 border border-zinc-800/70">
+        {/* Controls & Calibration Panel */}
+        <div className="w-full max-w-xl flex flex-col gap-3 p-4 rounded-xl bg-zinc-900/40 border border-zinc-800/70">
           <div className="flex items-center justify-between">
             <div className="flex flex-col">
               <span className="text-xs font-medium text-zinc-200">
-                Posture Threshold Calibration
+                Baseline Calibration
               </span>
               <span className="text-[11px] text-zinc-500">
-                Adjust sensitivity or calibrate to your upright height
+                Calibrates scale-invariant ratio (vertical distance / shoulder width)
               </span>
             </div>
 
             <div className="flex items-center gap-2">
               <button
                 type="button"
-                onClick={handleCalibrate}
-                className="px-3 py-1.5 rounded-lg bg-zinc-100 hover:bg-white text-zinc-900 text-xs font-medium transition-colors cursor-pointer"
+                onClick={handleCalibrateBaseline}
+                className="px-3 py-1.5 rounded-lg bg-zinc-100 hover:bg-white text-zinc-900 text-xs font-semibold transition-colors cursor-pointer shadow-sm active:scale-95"
               >
-                Calibrate Current
+                Calibrate Baseline
               </button>
-              <button
-                type="button"
-                onClick={handleResetThreshold}
-                className="px-2.5 py-1.5 rounded-lg bg-zinc-800 hover:bg-zinc-700 text-zinc-300 text-xs transition-colors cursor-pointer"
-                title="Reset to default (70px)"
-              >
-                Reset
-              </button>
+
+              {baseline !== null && (
+                <button
+                  type="button"
+                  onClick={handleResetBaseline}
+                  className="px-2.5 py-1.5 rounded-lg bg-zinc-800 hover:bg-zinc-700 text-zinc-300 text-xs transition-colors cursor-pointer"
+                  title="Clear baseline"
+                >
+                  Reset
+                </button>
+              )}
+
               <button
                 type="button"
                 onClick={() => setIsCameraActive((prev) => !prev)}
@@ -573,24 +604,8 @@ export default function PostureMonitorPage() {
             </div>
           </div>
 
-          {/* Threshold Slider */}
-          <div className="flex items-center gap-3">
-            <span className="text-[10px] font-mono text-zinc-500 w-8">30px</span>
-            <input
-              type="range"
-              min="30"
-              max="130"
-              value={threshold}
-              onChange={(e) => setThreshold(Number(e.target.value))}
-              className="flex-1 h-1.5 bg-zinc-800 rounded-lg appearance-none cursor-pointer accent-zinc-200"
-            />
-            <span className="text-[10px] font-mono text-zinc-500 w-10 text-right">
-              130px
-            </span>
-          </div>
-
           {calibrationNotice && (
-            <p className="text-xs font-mono text-emerald-400/90 text-center animate-fade-in">
+            <p className="text-xs font-mono text-emerald-400/90 text-center animate-fade-in mt-1">
               {calibrationNotice}
             </p>
           )}
@@ -600,7 +615,7 @@ export default function PostureMonitorPage() {
       {/* Footer */}
       <footer className="w-full max-w-4xl pt-4 border-t border-zinc-900 flex items-center justify-between text-[11px] text-zinc-600 font-mono">
         <span>TENSORFLOW.JS // MOVENET LIGHTNING</span>
-        <span>NEXT.js CLIENT COMPONENT</span>
+        <span>SCALE-INVARIANT RATIO TELEMETRY</span>
       </footer>
     </div>
   );
